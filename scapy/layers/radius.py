@@ -31,6 +31,7 @@ from scapy.fields import (
     ByteEnumField,
     ByteField,
     FieldLenField,
+    FlagsField,
     IPField,
     IntEnumField,
     IntField,
@@ -256,6 +257,15 @@ _radius_attribute_types = {
     189: "WLAN-Group-Mgmt-Cipher",
     190: "WLAN-RF-Band",
     191: "Unassigned",
+    # RFC 7930 / RFC 6929: extended attribute space
+    241: "Extended-Attribute-1",
+    242: "Extended-Attribute-2",
+    243: "Extended-Attribute-3",
+    244: "Extended-Attribute-4",
+    245: "Extended-Attribute-5",
+    246: "Extended-Attribute-6",
+    247: "Extended-Attribute-7",
+    248: "Extended-Attribute-8",
 }
 
 
@@ -1143,6 +1153,238 @@ class RadiusAttr_EAP_Message(RadiusAttribute):
                     self.value = EAP(buf)
                     return x
         return s
+
+
+#
+# RFC 7930 / RFC 6929: extended attributes
+#
+# Two families are registered in the RADIUS attribute type space:
+#
+#   * Short Extended Attributes (types 241-244) carry a one-octet
+#     Extended-Type together with a one-octet Flags field, followed by the
+#     Value::
+#
+#         Type (1) | Length (1) | Extended-Type (1) | Flags (1) | Value ...
+#
+#     Their header is 4 octets long, so a single attribute carries at most
+#     251 octets of Value (Length 255 - 4). Values that do not fit are split
+#     over a chain of consecutive attributes: every fragment but the last one
+#     sets the "M" (More) flag and carries a full 255-octet attribute.
+#
+#   * Long Extended Attributes (types 245-248) carry a four-octet
+#     Extended-Type followed by a one-octet Flags field and a one-octet
+#     Reserved field::
+#
+#         Type (1) | Length (1) | Extended-Type (4) | Flags (1) |
+#         Reserved (1) | Value ...
+#
+#     Their header is 8 octets long, so a single attribute carries at most
+#     247 octets of Value (Length 255 - 8).
+#
+# The Flags byte is shared by both families: its most significant bit is the
+# "M" (More) continuation flag and the next bit is the "E" (Encrypt) flag.
+# The remaining six bits are reserved, transported as-is and sent as zero.
+#
+# The "E" flag only signals that the Value is protected by some key material
+# known to the peers: neither RFC 7930 nor RFC 6929 defines an encryption
+# algorithm for extended attributes. Scapy therefore exposes the flag (and an
+# ``encrypted`` convenience property) and keeps the Value opaque, without
+# attempting any automatic encryption or decryption. This mirrors how
+# confidentiality is left to outer protection (e.g. TLS per RFC 6614) and
+# lets callers plug their own crypto while preserving a byte-exact
+# build/dissect round trip.
+
+_radius_ext_flags = {
+    0x80: "M",  # More: another fragment of the same chain follows
+    0x40: "E",  # Encrypt: the Value is encrypted out of band
+}
+
+
+class _RadiusAttrExtended(RadiusAttribute):
+    """
+    Common machinery for the RFC 7930 extended attribute families. It exposes
+    the Extended-Type and the Flags byte (M/E flags) instead of burying them
+    inside an opaque generic value.
+    """
+
+    __slots__ = ["val"]
+    match_subclass = True
+
+    def __init__(self, _pkt="", post_transform=None, _internal=0, _underlayer=None, **fields):  # noqa: E501
+        super(_RadiusAttrExtended, self).__init__(
+            _pkt,
+            post_transform,
+            _internal,
+            _underlayer,
+            **fields
+        )
+        if hasattr(self, "val"):
+            self.fields["type"] = self.val
+        name_parts = self.__class__.__name__.split('RadiusAttr_')
+        if len(name_parts) < 2:
+            raise Scapy_Exception(
+                "Invalid class name: {}".format(self.__class__.__name__)
+            )
+        self.name = name_parts[1].replace('_', '-')
+
+    @property
+    def more(self):
+        # type: () -> bool
+        """True when the M (More) continuation flag is set."""
+        return bool(self.flags & 0x80)
+
+    @property
+    def encrypted(self):
+        # type: () -> bool
+        """True when the E (Encrypt) flag is set.
+
+        The flag is only reported: Scapy never decrypts the Value on its own
+        since no encryption algorithm is defined for extended attributes.
+        """
+        return bool(self.flags & 0x40)
+
+
+# Maximum Value length that fits in a single on-wire attribute
+_RADIUS_SHORT_EXT_MAX_VALUE = 251   # Length 255 - 4-octet header
+_RADIUS_LONG_EXT_MAX_VALUE = 247    # Length 255 - 8-octet header
+
+
+class RadiusAttr_ShortExtended(_RadiusAttrExtended):
+    """
+    Implements a Short Extended Attribute (RFC 7930 / RFC 6929, types
+    241-244). Continuation chains of consecutive attributes sharing the same
+    Type and Extended-Type are reassembled on dissection, following the same
+    post-dissect "swallowing" pattern as RadiusAttr_EAP_Message.
+    """
+
+    fields_desc = [
+        ByteEnumField("type", 241, _radius_attribute_types),
+        FieldLenField(
+            "len",
+            None,
+            "value",
+            "B",
+            adjust=lambda pkt, x: len(pkt.value) + 4
+        ),
+        ByteField("extended_type", 0),
+        FlagsField("flags", 0, 8, _radius_ext_flags),
+        XStrLenField(
+            "value",
+            "",
+            length_from=lambda pkt: max(0, pkt.len - 4)
+        ),
+    ]
+
+    def post_dissect(self, s):
+        if not conf.contribs.get("radius", {}).get("auto-defrag", True):
+            return s
+        if not self.more:
+            return s
+        # Reassemble the continuation chain. Fragments are consecutive and
+        # each continuation must carry the same Type and Extended-Type.
+        buf = self.value
+        x = s
+        while x and self.more:
+            length = struct.unpack("!B", x[1:2])[0]
+            # Avoid an infinite loop on truncated or malformed data
+            if length < 4 or length > len(x):
+                return s
+            nxt_type = x[0]
+            nxt_ext_type = x[2]
+            nxt_flags = x[3]
+            if nxt_type != self.type or nxt_ext_type != self.extended_type:
+                return s
+            buf += x[4:length]
+            x = x[length:]
+            if not nxt_flags & 0x80:
+                # Last fragment of the chain
+                self.value = buf
+                # The M flag belongs to the wire fragments, not to the
+                # reassembled logical value.
+                self.flags = self.flags & ~0x80
+                # Force the length to be recomputed from the Value on build
+                self.len = None
+                return x
+        # Dangling chain (no terminal fragment): leave the packet untouched
+        return s
+
+    @staticmethod
+    def fragment_value(extended_type, value, attr_type=241, encrypted=False):
+        """
+        Build the list of Short Extended Attributes carrying ``value``,
+        automatically splitting long values into 251-octet fragments and
+        setting the M (More) flag on every fragment but the last one.
+
+        :param extended_type: the one-octet Extended-Type
+        :param value: the logical Value to fragment (``bytes``)
+        :param attr_type: the wrapping RADIUS attribute type (241-244)
+        :param encrypted: set the E (Encrypt) flag on every fragment
+        :return: a list of RadiusAttr_ShortExtended packets, in order
+        """
+        value = bytes_encode(value)
+        flags = (0x40 if encrypted else 0)
+        fragments = []
+        offset = 0
+        total = len(value)
+        while offset < total or not fragments:
+            chunk = value[offset:offset + _RADIUS_SHORT_EXT_MAX_VALUE]
+            offset += _RADIUS_SHORT_EXT_MAX_VALUE
+            more = offset < total
+            fragments.append(
+                RadiusAttr_ShortExtended(
+                    type=attr_type,
+                    extended_type=extended_type,
+                    flags=flags | (0x80 if more else 0),
+                    value=chunk,
+                )
+            )
+        return fragments
+
+
+class RadiusAttr_LongExtended(_RadiusAttrExtended):
+    """
+    Implements a Long Extended Attribute (RFC 7930 / RFC 6929, types
+    245-248). The Extended-Type is four octets wide and is followed by the
+    Flags byte and a one-octet Reserved field that is sent as zero and
+    preserved as-is on dissection.
+    """
+
+    fields_desc = [
+        ByteEnumField("type", 245, _radius_attribute_types),
+        FieldLenField(
+            "len",
+            None,
+            "value",
+            "B",
+            adjust=lambda pkt, x: len(pkt.value) + 8
+        ),
+        IntField("extended_type", 0),
+        FlagsField("flags", 0, 8, _radius_ext_flags),
+        ByteField("reserved", 0),
+        XStrLenField(
+            "value",
+            "",
+            length_from=lambda pkt: max(0, pkt.len - 8)
+        ),
+    ]
+
+
+# Register the eight extended attribute types in the dispatch table.
+for _ext_type in range(241, 245):
+    globals()["RadiusAttr_Extended_Attribute_%d" % (_ext_type - 240)] = type(
+        "RadiusAttr_Extended_Attribute_%d" % (_ext_type - 240),
+        (RadiusAttr_ShortExtended,),
+        {"val": _ext_type},
+    )
+
+for _ext_type in range(245, 249):
+    globals()["RadiusAttr_Extended_Attribute_%d" % (_ext_type - 240)] = type(
+        "RadiusAttr_Extended_Attribute_%d" % (_ext_type - 240),
+        (RadiusAttr_LongExtended,),
+        {"val": _ext_type},
+    )
+
+del _ext_type
 
 
 _radius_vendor_types = {

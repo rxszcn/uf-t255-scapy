@@ -251,3 +251,133 @@ assert pkt.summary() == "Ether / IP / UDP / RADIUS Access-Request (User:'user' M
 
 pkt = Ether(b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x08\x00E\x00\x00Z\x00\x8e\x00\x00@\x11|\x03\x7f\x00\x00\x01\x7f\x00\x00\x01\x9f<\x07\x14\x00F\xfeY\x01\xfb\x00>s0\x00\x13\x86x\xd7\x11\xc4\x9e\xe1=\xce&r<P\x12\xbfL!\xb2\xd5WP!\xa8)}\tYZ&*\x01\x06user\x02\x12\x8f\x00\x8e\xdb4\xb1\x1a\xaf\x1f\xc7[\x9aD\xfff\xbd')
 assert pkt.summary() == "Ether / IP / UDP / RADIUS Access-Request (User:'user' PAP)"
+
+= RADIUS - RFC 7930 short extended attribute - flags and round trip
+
+# Types 241-244 are dispatched to structured short extended attributes
+p = RadiusAttr_Extended_Attribute_1(extended_type=3, flags=0x40, value=b"hello")
+s = raw(p)
+assert s == b'\xf1\x09\x03\x40hello'
+
+p = RadiusAttribute(s)
+assert type(p) == RadiusAttr_Extended_Attribute_1
+assert p.type == 241
+assert p.extended_type == 3
+assert p.flags == 0x40
+assert p.more is False
+assert p.encrypted is True
+assert p.value == b"hello"
+# Opaque byte round trip is preserved
+assert raw(p) == s
+
+# The six reserved flag bits are transported as-is
+p = RadiusAttribute(b'\xf1\x0a\x03\x07abcdef')
+assert p.flags == 0x07
+assert p.more is False and p.encrypted is False
+assert raw(p) == b'\xf1\x0a\x03\x07abcdef'
+
+= RADIUS - RFC 7930 short extended attribute - continuation reassembly
+
+conf.contribs.setdefault("radius", {})["auto-defrag"] = True
+
+# A 255-octet logical value is fragmented into a full 255-octet M=1
+# attribute followed by the 4-octet-header terminating fragment.
+logical_value = bytes(range(251)) + b"TAIL"
+fragments = RadiusAttr_ShortExtended.fragment_value(7, logical_value, attr_type=242)
+assert len(fragments) == 2
+assert raw(fragments[0])[1] == 255
+assert fragments[0].more is True and fragments[0].extended_type == 7
+assert fragments[1].more is False and fragments[1].value == b"TAIL"
+
+chain = b"".join(raw(f) for f in fragments)
+radius_packet = Radius(
+    b'\x01\x01' + struct.pack("!H", 20 + len(chain)) + b'\x00' * 16 + chain
+)
+# The consecutive continuation chain is swallowed into one logical attribute
+assert len(radius_packet.attributes) == 1
+head = radius_packet.attributes[0]
+assert type(head) == RadiusAttr_Extended_Attribute_2
+assert head.extended_type == 7
+assert head.more is False
+assert head.value == logical_value
+
+# With auto-defrag disabled, the wire fragments remain separate attributes
+conf.contribs["radius"]["auto-defrag"] = False
+radius_packet = Radius(
+    b'\x01\x01' + struct.pack("!H", 20 + len(chain)) + b'\x00' * 16 + chain
+)
+assert len(radius_packet.attributes) == 2
+assert radius_packet.attributes[0].more is True
+assert radius_packet.attributes[1].more is False
+conf.contribs["radius"]["auto-defrag"] = True
+
+# A dangling M=1 fragment (no successor) is left untouched
+dangling = b'\xf2\xff\x07\x80' + b'B' * 251
+radius_packet = Radius(
+    b'\x01\x01' + struct.pack("!H", 20 + len(dangling)) + b'\x00' * 16 + dangling
+)
+assert len(radius_packet.attributes) == 1
+assert radius_packet.attributes[0].more is True
+assert radius_packet.attributes[0].value == b'B' * 251
+
+= RADIUS - RFC 7930 long extended attribute - dissection and round trip
+
+# Types 245-248 carry a four-octet Extended-Type, a Flags byte and a
+# one-octet Reserved field.
+p = RadiusAttr_Extended_Attribute_5(
+    extended_type=0x11223344, flags=0x80, reserved=0, value=b"longval"
+)
+s = raw(p)
+assert s == b'\xf5\x0f\x11\x22\x33\x44\x80\x00longval'
+
+p = RadiusAttribute(s)
+assert type(p) == RadiusAttr_Extended_Attribute_5
+assert p.type == 245
+assert p.extended_type == 0x11223344
+assert p.flags == 0x80
+assert p.more is True and p.encrypted is False
+assert p.reserved == 0
+assert p.value == b"longval"
+assert raw(p) == s
+
+# The Reserved byte is preserved on dissection
+p = RadiusAttribute(b'\xf5\x0c\x11\x22\x33\x44\x05\x3aabcd')
+assert p.flags == 0x05 and p.reserved == 0x3a
+assert raw(p) == b'\xf5\x0c\x11\x22\x33\x44\x05\x3aabcd'
+
+# Type 248 closes the registered long extended range
+p = RadiusAttr_Extended_Attribute_8(extended_type=255, value=b"x")
+assert raw(p) == b'\xf8\x09\x00\x00\x00\xff\x00\x00x'
+assert type(RadiusAttribute(raw(p))) == RadiusAttr_Extended_Attribute_8
+
+= RADIUS - RFC 7930 short extended attribute - fragmentation build API
+
+# A 600-octet value is split into 251 / 251 / 98 octet fragments, with the
+# M flag on the first two and the E flag propagated to every fragment.
+big_value = b'A' * 600
+fragments = RadiusAttr_ShortExtended.fragment_value(
+    10, big_value, attr_type=243, encrypted=True
+)
+assert len(fragments) == 3
+assert [len(f.value) for f in fragments] == [251, 251, 98]
+assert [f.more for f in fragments] == [True, True, False]
+assert all(f.encrypted for f in fragments)
+assert all(f.type == 243 and f.extended_type == 10 for f in fragments)
+
+chain = b"".join(raw(f) for f in fragments)
+assert chain[0] == 243 and chain[1] == 255 and chain[3] == 0xC0
+radius_packet = Radius(
+    b'\x01\x01' + struct.pack("!H", 20 + len(chain)) + b'\x00' * 16 + chain
+)
+assert len(radius_packet.attributes) == 1
+head = radius_packet.attributes[0]
+assert type(head) == RadiusAttr_Extended_Attribute_3
+assert head.value == big_value
+assert head.encrypted is True
+assert head.more is False
+
+# A value that fits in one attribute produces a single fragment without M
+fragments = RadiusAttr_ShortExtended.fragment_value(9, b"abc")
+assert len(fragments) == 1
+assert fragments[0].more is False and fragments[0].value == b"abc"
+assert raw(fragments[0]) == b'\xf1\x07\x09\x00abc'
